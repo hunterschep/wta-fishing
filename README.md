@@ -29,7 +29,8 @@ This walks every trip report for the hike (via WTA's paginated `@@related_tripre
 - `--text-only` — skip photo captions entirely, fastest option
 - `--save-images DIR` — download every photo from every scanned report into `DIR`, plus a `manifest.json` mapping each file back to its report URL, date, and caption. Useful because caption text alone misses photos that show fishing/fish but aren't captioned as such.
 - `-o, --output FILE` — write the full results as JSON
-- `-v, --verbose` — print progress to stderr
+- `-v, --verbose` — print detailed fetch progress to stderr
+- `--no-progress` — suppress the live progress bar shown during normal terminal runs
 - `--delay SECONDS` — delay between HTTP requests (default 0.5s; be polite to WTA's servers)
 
 ## Reviewing downloaded photos

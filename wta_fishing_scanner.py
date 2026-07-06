@@ -38,6 +38,16 @@ PLACE_NAME_PATTERNS = [
 SNIPPET_RADIUS = 90
 
 
+def parse_trip_report_count(soup):
+    count_el = soup.select_one("#count-data, .count-data")
+    if not count_el:
+        return None
+    match = re.search(r"[\d,]+", count_el.get_text(" ", strip=True))
+    if not match:
+        return None
+    return int(match.group(0).replace(",", ""))
+
+
 def find_matches(text):
     excluded_spans = [m.span() for pat in PLACE_NAME_PATTERNS for m in pat.finditer(text)]
 
@@ -68,6 +78,65 @@ def normalize_hike_url(url):
     if path.endswith("/hike_view"):
         path = path[: -len("/hike_view")]
     return f"{parsed.scheme}://{parsed.netloc}{path}"
+
+
+class ProgressBar:
+    def __init__(self, enabled=True, stream=None):
+        self.enabled = enabled
+        self.stream = stream or sys.stderr
+        self.last_len = 0
+
+    def __call__(self, event):
+        if not self.enabled:
+            return
+        name = event["event"]
+        if name == "start":
+            title = event.get("title") or event.get("hike_url")
+            self._write(f"Preparing scan: {title}")
+        elif name == "total":
+            total = event.get("total")
+            if total is not None:
+                self._write(f"Found {total} trip report(s); scanning...")
+            else:
+                self._write("Scanning trip reports...")
+        elif name == "report":
+            self._draw(
+                event.get("scanned", 0),
+                event.get("total"),
+                event.get("matches", 0),
+                event.get("images", 0),
+            )
+        elif name == "finish":
+            self._draw(
+                event.get("scanned", 0),
+                event.get("total"),
+                event.get("matches", 0),
+                event.get("images", 0),
+                done=True,
+            )
+
+    def _write(self, message):
+        padding = " " * max(0, self.last_len - len(message))
+        print(f"\r{message}{padding}", end="", file=self.stream, flush=True)
+        self.last_len = len(message)
+
+    def _draw(self, scanned, total, matches, images, done=False):
+        width = 28
+        if total:
+            filled = min(width, int(width * scanned / total))
+            bar = "#" * filled + "-" * (width - filled)
+            message = f"Scanning [{bar}] {scanned}/{total} reports"
+        else:
+            message = f"Scanning {scanned} report(s)"
+        message += f" | matches: {matches}"
+        if images:
+            message += f" | images: {images}"
+        if done:
+            message += " | done"
+        self._write(message)
+        if done:
+            print(file=self.stream, flush=True)
+            self.last_len = 0
 
 
 class Scanner:
@@ -107,10 +176,11 @@ class Scanner:
             return soup.title.get_text(strip=True)
         return None
 
-    def iter_trip_report_urls(self, hike_url, max_reports=None):
+    def iter_trip_report_urls(self, hike_url, max_reports=None, total_callback=None):
         listing_url = hike_url + "/@@related_tripreport_listing"
         seen = set()
         count = 0
+        reported_total = False
         while listing_url:
             self.log(f"Fetching listing page: {listing_url}")
             try:
@@ -119,6 +189,13 @@ class Scanner:
                 self.log(f"Failed to fetch listing page: {e}")
                 break
             soup = BeautifulSoup(html, "lxml")
+            if not reported_total:
+                total = parse_trip_report_count(soup)
+                if total is not None and max_reports is not None:
+                    total = min(total, max_reports)
+                if total_callback:
+                    total_callback(total)
+                reported_total = True
 
             for item in soup.select("div.item"):
                 link = item.select_one("h3.listitem-title a")
@@ -209,26 +286,57 @@ class Scanner:
         return result
 
     def scan_hike(self, hike_url, max_reports=None, text_only=False, save_images_dir=None,
-                  photos_mode="all"):
+                  photos_mode="all", progress_callback=None):
         hike_url = normalize_hike_url(hike_url)
         title = self.get_hike_title(hike_url)
         manifest = [] if save_images_dir else None
         if save_images_dir:
             os.makedirs(save_images_dir, exist_ok=True)
         reports = []
-        for report_url in self.iter_trip_report_urls(hike_url, max_reports=max_reports):
+        scanned = 0
+        total_reports = None
+        if progress_callback:
+            progress_callback({"event": "start", "hike_url": hike_url, "title": title})
+
+        def set_total(total):
+            nonlocal total_reports
+            total_reports = total
+            if progress_callback:
+                progress_callback({"event": "total", "total": total})
+
+        for report_url in self.iter_trip_report_urls(
+            hike_url, max_reports=max_reports, total_callback=set_total,
+        ):
             self.log(f"Scanning trip report: {report_url}")
             report = self.scan_trip_report(
                 report_url, text_only=text_only,
                 save_images_dir=save_images_dir, manifest=manifest,
                 photos_mode=photos_mode,
             )
+            scanned += 1
             if report["text_matches"] or report["image_matches"]:
                 reports.append(report)
+            if progress_callback:
+                progress_callback({
+                    "event": "report",
+                    "scanned": scanned,
+                    "total": total_reports,
+                    "matches": len(reports),
+                    "images": len(manifest) if manifest is not None else 0,
+                })
 
         if save_images_dir:
             with open(os.path.join(save_images_dir, "manifest.json"), "w") as f:
                 json.dump(manifest, f, indent=2)
+
+        if progress_callback:
+            progress_callback({
+                "event": "finish",
+                "scanned": scanned,
+                "total": total_reports,
+                "matches": len(reports),
+                "images": len(manifest) if manifest is not None else 0,
+            })
 
         return {
             "hike_url": hike_url,
@@ -309,16 +417,22 @@ def main():
                               "http://localhost:11434)")
     parser.add_argument("-o", "--output", help="Write full JSON results to this file")
     parser.add_argument("-v", "--verbose", action="store_true",
-                         help="Print progress to stderr")
+                         help="Print detailed fetch progress to stderr")
+    parser.add_argument("--no-progress", action="store_true",
+                         help="Disable the live progress bar")
     args = parser.parse_args()
 
     if args.vision_review and not args.save_images:
         parser.error("--vision-review requires --save-images")
 
     scanner = Scanner(delay=args.delay, verbose=args.verbose)
+    progress = ProgressBar(enabled=(
+        sys.stderr.isatty() and not args.verbose and not args.no_progress
+    ))
     results = scanner.scan_hike(
         args.hike_url, max_reports=args.max_reports, text_only=args.text_only,
         save_images_dir=args.save_images, photos_mode=args.photos_mode,
+        progress_callback=progress,
     )
     print_results(results)
 
