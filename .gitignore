@@ -4,6 +4,29 @@ __pycache__/
 .DS_Store
 .env
 
-# Generated scan output (photos, contact sheets, reports) -- regenerate via
-# wta_fishing_scanner.py / run_region_scan.py rather than committing.
-output/
+# Generated scan output (photos, contact sheets, JSON, logs) -- regenerate via
+# wta_fishing_scanner.py / run_region_scan.py rather than committing. Region
+# markdown reports and the local photos they embed are tracked (see below).
+output/*
+!output/*.md
+!output/region_images/
+output/region_images/*
+!output/region_images/*/
+output/region_images/*/*
+!output/region_images/annette-lake/trip_report-2024-08-31.082839769056_02.jpeg
+!output/region_images/annette-lake/trip_report.2015-09-28.5725731032_03.jpeg
+!output/region_images/annette-lake/trip_report.2017-08-20.9973951123_00.jpeg
+!output/region_images/annette-lake/trip_report.2019-08-26.2986195346_01.jpeg
+!output/region_images/annette-lake/tripreport-2008071801_00.jpeg
+!output/region_images/kendall-peak-lakes/trip_report-2026-06-01.135853180340_02.jpeg
+!output/region_images/lila-lake/trip_report-2025-07-22.111755700378_03.jpeg
+!output/region_images/nordrum-lake/trip_report.2017-09-15.9848338230_00.jpeg
+!output/region_images/pete-lake/trip_report-2020-06-14-5472590442_00.jpeg
+!output/region_images/rampart-ridge---rampart-lakes/trip_report-2026-06-15.072707645417_02.jpeg
+!output/region_images/rampart-ridge---rampart-lakes/trip_report.2017-08-14.2360367245_01.jpeg
+!output/region_images/rampart-ridge---rampart-lakes/trip_report.2022-09-06.7170241515_00.jpeg
+!output/region_images/rock-creek/trip_report.2023-10-09.6139412841_03.jpeg
+!output/region_images/spade-lake/trip_report.2022-08-26.2558375688_00.jpeg
+!output/region_images/sunday-lake/trip_report.2018-06-04.6417194305_00.jpeg
+!output/region_images/taylor-river---otter-falls/trip_report-2021-07-22-2588634464_01.jpeg
+!output/region_images/waptus-lake-via-waptus-river/trip_report-2020-11-02-9420842616_01.jpeg
