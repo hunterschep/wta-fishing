@@ -15,7 +15,6 @@ hikes don't serialize behind the rest of the region.
 import argparse
 import json
 import os
-import re
 import sys
 import threading
 import time
@@ -23,13 +22,16 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
 import requests
+from bs4 import BeautifulSoup
 
 from make_contact_sheets import build_contact_sheets
 from vision_review import (
     review_images_dir, _setup_backend,
     DEFAULT_BACKEND as DEFAULT_VISION_BACKEND, DEFAULT_MODELS as DEFAULT_VISION_MODELS,
 )
-from wta_fishing_scanner import Scanner, USER_AGENT, normalize_hike_url
+from wta_fishing_scanner import (
+    Scanner, USER_AGENT, normalize_hike_url, parse_trip_report_count,
+)
 
 
 def load_hikes(path):
@@ -44,15 +46,16 @@ def slugify(name):
 def get_report_count(session, url):
     try:
         r = session.get(url.rstrip("/") + "/@@related_tripreport_listing", timeout=15)
-        m = re.search(r'count-data">([\d,]+)<', r.text)
-        return int(m.group(1).replace(",", "")) if m else 0
+        r.raise_for_status()
+        count = parse_trip_report_count(BeautifulSoup(r.text, "lxml"))
+        return count or 0
     except requests.RequestException:
         return 0
 
 
 def scan_one_hike(hike, delay, max_reports, out_dir, images_dir, photos_mode,
                    vision_review=False, vision_backend=None, vision_model=None,
-                   vision_base_url=None):
+                   vision_base_url=None, hike_workers=1):
     name, url = hike["name"], hike["url"]
     scanner = Scanner(delay=delay, verbose=True)
     slug = slugify(name)
@@ -63,6 +66,7 @@ def scan_one_hike(hike, delay, max_reports, out_dir, images_dir, photos_mode,
         result = scanner.scan_hike(
             url, max_reports=max_reports,
             save_images_dir=hike_images_dir, photos_mode=photos_mode,
+            workers=hike_workers,
         )
     except Exception as e:
         result = {
@@ -106,7 +110,7 @@ def scan_one_hike(hike, delay, max_reports, out_dir, images_dir, photos_mode,
 def scan_region(hikes, out_dir, delay=0.5, max_reports=None, workers=6,
                  images_dir=None, photos_mode="matched",
                  vision_review=False, vision_backend=None, vision_model=None,
-                 vision_base_url=None):
+                 vision_base_url=None, hike_workers=1):
     os.makedirs(out_dir, exist_ok=True)
 
     probe_session = requests.Session()
@@ -129,13 +133,14 @@ def scan_region(hikes, out_dir, delay=0.5, max_reports=None, workers=6,
             json.dump(results, f, indent=2)
 
     print(f"Scanning {total} hikes with {workers} parallel workers "
-          f"(photos_mode={photos_mode}, vision_review={vision_review})...",
+          f"(hike_workers={hike_workers}, photos_mode={photos_mode}, "
+          f"vision_review={vision_review})...",
           file=sys.stderr, flush=True)
     with ThreadPoolExecutor(max_workers=workers) as executor:
         future_to_hike = {
             executor.submit(scan_one_hike, h, delay, max_reports, out_dir,
                              images_dir, photos_mode, vision_review, vision_backend,
-                             vision_model, vision_base_url): h
+                             vision_model, vision_base_url, hike_workers): h
             for h in hikes
         }
         for future in as_completed(future_to_hike):
@@ -288,6 +293,10 @@ def main():
                          help="Delay in seconds between requests, per worker (default: 0.5)")
     parser.add_argument("--workers", type=int, default=6,
                          help="Number of hikes to scan concurrently (default: 6)")
+    parser.add_argument("--hike-workers", type=int, default=1,
+                         help="Number of trip reports/listing pages to fetch concurrently "
+                              "inside each hike (default: 1; increase carefully with "
+                              "--workers because total concurrency multiplies)")
     parser.add_argument("--max-reports", type=int, default=None,
                          help="Cap trip reports scanned per hike (default: no cap, full history)")
     parser.add_argument("--images-dir", default="output/region_images",
@@ -345,6 +354,7 @@ def main():
         vision_backend=args.vision_backend,
         vision_model=args.vision_model,
         vision_base_url=args.vision_base_url,
+        hike_workers=args.hike_workers,
     )
     build_markdown(results, args.markdown, args.region_name)
     print(f"Wrote {args.markdown}", file=sys.stderr)

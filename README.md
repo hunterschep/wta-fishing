@@ -26,12 +26,21 @@ This walks every trip report for the hike (via WTA's paginated `@@related_tripre
 ### Options
 
 - `--max-reports N` — limit how many trip reports to scan (useful for a quick test)
+- `--workers N` — fetch listing pages and trip reports concurrently (default 6; use 1 for the old serial behavior)
 - `--text-only` — skip photo captions entirely, fastest option
 - `--save-images DIR` — download every photo from every scanned report into `DIR`, plus a `manifest.json` mapping each file back to its report URL, date, and caption. Useful because caption text alone misses photos that show fishing/fish but aren't captioned as such.
 - `-o, --output FILE` — write the full results as JSON
 - `-v, --verbose` — print detailed fetch progress to stderr
 - `--no-progress` — suppress the live progress bar shown during normal terminal runs
-- `--delay SECONDS` — delay between HTTP requests (default 0.5s; be polite to WTA's servers)
+- `--delay SECONDS` — delay after each HTTP request, per worker (default 0.5s; be polite to WTA's servers)
+
+For faster single-hike scans, keep the default workers or tune explicitly:
+
+```
+.venv/bin/python wta_fishing_scanner.py https://www.wta.org/go-hiking/hikes/gravel-lake --workers 8
+```
+
+`run_region_scan.py` already scans multiple hikes at once with `--workers`; it also supports `--hike-workers` if you want concurrency inside each hike. Increase that carefully because total request concurrency is roughly `--workers * --hike-workers`.
 
 ## Reviewing downloaded photos
 

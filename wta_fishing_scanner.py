@@ -6,7 +6,9 @@ import json
 import os
 import re
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urljoin, urlparse
 
 import requests
@@ -46,6 +48,44 @@ def parse_trip_report_count(soup):
     if not match:
         return None
     return int(match.group(0).replace(",", ""))
+
+
+def parse_trip_report_urls(soup):
+    urls = []
+    for item in soup.select("div.item"):
+        link = item.select_one("h3.listitem-title a")
+        if link and link.get("href"):
+            urls.append(link["href"])
+    return urls
+
+
+def parse_next_listing_url(soup, current_url):
+    next_link = soup.select_one("nav.pagination li.next a")
+    if next_link and next_link.get("href"):
+        return urljoin(current_url, next_link["href"])
+    return None
+
+
+def make_listing_url(hike_url, offset=0):
+    base_url = hike_url.rstrip("/") + "/@@related_tripreport_listing"
+    if offset <= 0:
+        return base_url
+    return f"{base_url}?b_start:int={offset}"
+
+
+def dedupe_in_order(urls, limit=None):
+    if limit is not None and limit <= 0:
+        return []
+    seen = set()
+    unique_urls = []
+    for url in urls:
+        if url in seen:
+            continue
+        seen.add(url)
+        unique_urls.append(url)
+        if limit is not None and len(unique_urls) >= limit:
+            break
+    return unique_urls
 
 
 def find_matches(text):
@@ -96,9 +136,15 @@ class ProgressBar:
         elif name == "total":
             total = event.get("total")
             if total is not None:
-                self._write(f"Found {total} trip report(s); scanning...")
+                self._write(f"Found {total} trip report(s); collecting report list...")
             else:
-                self._write("Scanning trip reports...")
+                self._write("Collecting report list...")
+        elif name == "listing":
+            self._draw_listing(
+                event.get("pages_done", 0),
+                event.get("pages_total"),
+                event.get("urls", 0),
+            )
         elif name == "report":
             self._draw(
                 event.get("scanned", 0),
@@ -120,6 +166,16 @@ class ProgressBar:
         print(f"\r{message}{padding}", end="", file=self.stream, flush=True)
         self.last_len = len(message)
 
+    def _draw_listing(self, pages_done, pages_total, urls):
+        width = 28
+        if pages_total:
+            filled = min(width, int(width * pages_done / pages_total))
+            bar = "#" * filled + "-" * (width - filled)
+            message = f"Listing  [{bar}] {pages_done}/{pages_total} pages | urls: {urls}"
+        else:
+            message = f"Listing pages: {pages_done} | urls: {urls}"
+        self._write(message)
+
     def _draw(self, scanned, total, matches, images, done=False):
         width = 28
         if total:
@@ -140,27 +196,46 @@ class ProgressBar:
 
 
 class Scanner:
-    def __init__(self, delay=0.5, verbose=False):
-        self.session = requests.Session()
-        self.session.headers.update({"User-Agent": USER_AGENT})
+    def __init__(self, delay=0.5, verbose=False, retries=1):
         self.delay = delay
         self.verbose = verbose
+        self.retries = retries
+        self._thread_local = threading.local()
 
     def log(self, msg):
         if self.verbose:
             print(msg, file=sys.stderr)
 
+    def get_session(self):
+        session = getattr(self._thread_local, "session", None)
+        if session is None:
+            session = requests.Session()
+            session.headers.update({"User-Agent": USER_AGENT})
+            self._thread_local.session = session
+        return session
+
+    def request(self, url, binary=False):
+        last_error = None
+        for attempt in range(self.retries + 1):
+            try:
+                resp = self.get_session().get(url, timeout=20)
+                resp.raise_for_status()
+                if self.delay:
+                    time.sleep(self.delay)
+                return resp.content if binary else resp.text
+            except requests.RequestException as e:
+                last_error = e
+                if attempt >= self.retries:
+                    raise
+                self.log(f"Retrying after request failure ({attempt + 1}/{self.retries}): {url}")
+                time.sleep(min(2.0, 0.5 * (attempt + 1)))
+        raise last_error
+
     def get(self, url):
-        resp = self.session.get(url, timeout=20)
-        resp.raise_for_status()
-        time.sleep(self.delay)
-        return resp.text
+        return self.request(url)
 
     def get_binary(self, url):
-        resp = self.session.get(url, timeout=20)
-        resp.raise_for_status()
-        time.sleep(self.delay)
-        return resp.content
+        return self.request(url, binary=True)
 
     def get_hike_title(self, hike_url):
         try:
@@ -176,45 +251,147 @@ class Scanner:
             return soup.title.get_text(strip=True)
         return None
 
-    def iter_trip_report_urls(self, hike_url, max_reports=None, total_callback=None):
-        listing_url = hike_url + "/@@related_tripreport_listing"
-        seen = set()
-        count = 0
-        reported_total = False
-        while listing_url:
-            self.log(f"Fetching listing page: {listing_url}")
+    def fetch_listing_page(self, listing_url):
+        self.log(f"Fetching listing page: {listing_url}")
+        html = self.get(listing_url)
+        soup = BeautifulSoup(html, "lxml")
+        return {
+            "url": listing_url,
+            "total": parse_trip_report_count(soup),
+            "report_urls": parse_trip_report_urls(soup),
+            "next_url": parse_next_listing_url(soup, listing_url),
+        }
+
+    def collect_trip_report_urls(self, hike_url, max_reports=None, workers=1,
+                                 progress_callback=None):
+        first_url = make_listing_url(hike_url)
+        try:
+            first_page = self.fetch_listing_page(first_url)
+        except requests.RequestException as e:
+            self.log(f"Failed to fetch listing page: {e}")
+            if progress_callback:
+                progress_callback({"event": "total", "total": None})
+            return [], None
+
+        raw_total = first_page["total"]
+        total = raw_total
+        if total is not None and max_reports is not None:
+            total = min(total, max_reports)
+        if progress_callback:
+            progress_callback({"event": "total", "total": total})
+
+        first_urls = first_page["report_urls"]
+        page_size = len(first_urls)
+        if max_reports is not None and page_size >= max_reports:
+            urls = dedupe_in_order(first_urls, limit=max_reports)
+            if progress_callback:
+                progress_callback({
+                    "event": "listing",
+                    "pages_done": 1,
+                    "pages_total": 1,
+                    "urls": len(urls),
+                })
+            return urls, total
+
+        if not raw_total or not page_size or workers <= 1:
+            return self.collect_trip_report_urls_serial(
+                first_page, max_reports=max_reports, progress_callback=progress_callback,
+            )
+
+        offsets = list(range(page_size, total or raw_total, page_size))
+        pages_total = 1 + len(offsets)
+        pages_done = 1
+        urls_by_offset = {0: first_urls}
+        if progress_callback:
+            progress_callback({
+                "event": "listing",
+                "pages_done": pages_done,
+                "pages_total": pages_total,
+                "urls": len(dedupe_in_order(first_urls, limit=max_reports)),
+            })
+
+        if offsets:
+            max_workers = min(max(1, workers), len(offsets))
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_to_offset = {
+                    executor.submit(self.fetch_listing_page, make_listing_url(hike_url, offset)): offset
+                    for offset in offsets
+                }
+                for future in as_completed(future_to_offset):
+                    offset = future_to_offset[future]
+                    try:
+                        page = future.result()
+                        urls_by_offset[offset] = page["report_urls"]
+                    except requests.RequestException as e:
+                        self.log(f"Failed to fetch listing page at offset {offset}: {e}")
+                        urls_by_offset[offset] = []
+                    pages_done += 1
+                    if progress_callback:
+                        urls_so_far = []
+                        for done_offset in sorted(urls_by_offset):
+                            urls_so_far.extend(urls_by_offset[done_offset])
+                        progress_callback({
+                            "event": "listing",
+                            "pages_done": pages_done,
+                            "pages_total": pages_total,
+                            "urls": len(dedupe_in_order(urls_so_far, limit=max_reports)),
+                        })
+
+        ordered_urls = []
+        for offset in sorted(urls_by_offset):
+            ordered_urls.extend(urls_by_offset[offset])
+        return dedupe_in_order(ordered_urls, limit=max_reports), total
+
+    def collect_trip_report_urls_serial(self, first_page, max_reports=None,
+                                        progress_callback=None):
+        pages = [first_page]
+        urls = list(first_page["report_urls"])
+        page_size = len(first_page["report_urls"]) or 1
+        total = first_page["total"]
+        pages_total = None
+        if total:
+            capped_total = min(total, max_reports) if max_reports is not None else total
+            pages_total = (capped_total + page_size - 1) // page_size
+
+        if progress_callback:
+            progress_callback({
+                "event": "listing",
+                "pages_done": 1,
+                "pages_total": pages_total,
+                "urls": len(dedupe_in_order(urls, limit=max_reports)),
+            })
+
+        next_url = first_page["next_url"]
+        while next_url and (max_reports is None or len(dedupe_in_order(urls)) < max_reports):
             try:
-                html = self.get(listing_url)
+                page = self.fetch_listing_page(next_url)
             except requests.RequestException as e:
                 self.log(f"Failed to fetch listing page: {e}")
                 break
-            soup = BeautifulSoup(html, "lxml")
-            if not reported_total:
-                total = parse_trip_report_count(soup)
-                if total is not None and max_reports is not None:
-                    total = min(total, max_reports)
-                if total_callback:
-                    total_callback(total)
-                reported_total = True
+            pages.append(page)
+            urls.extend(page["report_urls"])
+            next_url = page["next_url"]
+            if progress_callback:
+                progress_callback({
+                    "event": "listing",
+                    "pages_done": len(pages),
+                    "pages_total": pages_total,
+                    "urls": len(dedupe_in_order(urls, limit=max_reports)),
+                })
 
-            for item in soup.select("div.item"):
-                link = item.select_one("h3.listitem-title a")
-                if not link or not link.get("href"):
-                    continue
-                url = link["href"]
-                if url in seen:
-                    continue
-                seen.add(url)
-                yield url
-                count += 1
-                if max_reports is not None and count >= max_reports:
-                    return
+        return dedupe_in_order(urls, limit=max_reports), (
+            min(total, max_reports) if total is not None and max_reports is not None else total
+        )
 
-            next_link = soup.select_one("nav.pagination li.next a")
-            if next_link and next_link.get("href"):
-                listing_url = urljoin(listing_url, next_link["href"])
-            else:
-                listing_url = None
+    def iter_trip_report_urls(self, hike_url, max_reports=None, total_callback=None):
+        def progress(event):
+            if total_callback and event["event"] == "total":
+                total_callback(event.get("total"))
+
+        urls, _ = self.collect_trip_report_urls(
+            hike_url, max_reports=max_reports, workers=1, progress_callback=progress,
+        )
+        yield from urls
 
     def scan_trip_report(self, url, text_only=False, save_images_dir=None, manifest=None,
                           photos_mode="all"):
@@ -285,45 +462,104 @@ class Scanner:
 
         return result
 
-    def scan_hike(self, hike_url, max_reports=None, text_only=False, save_images_dir=None,
-                  photos_mode="all", progress_callback=None):
-        hike_url = normalize_hike_url(hike_url)
-        title = self.get_hike_title(hike_url)
+    def scan_report_safe(self, index, report_url, text_only=False, save_images_dir=None,
+                         photos_mode="all"):
         manifest = [] if save_images_dir else None
-        if save_images_dir:
-            os.makedirs(save_images_dir, exist_ok=True)
-        reports = []
-        scanned = 0
-        total_reports = None
-        if progress_callback:
-            progress_callback({"event": "start", "hike_url": hike_url, "title": title})
-
-        def set_total(total):
-            nonlocal total_reports
-            total_reports = total
-            if progress_callback:
-                progress_callback({"event": "total", "total": total})
-
-        for report_url in self.iter_trip_report_urls(
-            hike_url, max_reports=max_reports, total_callback=set_total,
-        ):
-            self.log(f"Scanning trip report: {report_url}")
+        try:
             report = self.scan_trip_report(
                 report_url, text_only=text_only,
                 save_images_dir=save_images_dir, manifest=manifest,
                 photos_mode=photos_mode,
             )
-            scanned += 1
-            if report["text_matches"] or report["image_matches"]:
-                reports.append(report)
-            if progress_callback:
-                progress_callback({
-                    "event": "report",
-                    "scanned": scanned,
-                    "total": total_reports,
-                    "matches": len(reports),
-                    "images": len(manifest) if manifest is not None else 0,
-                })
+        except Exception as e:
+            self.log(f"Failed to scan trip report {report_url}: {e}")
+            report = {
+                "url": report_url,
+                "date": None,
+                "text_matches": [],
+                "image_matches": [],
+                "error": str(e),
+            }
+        return index, report, manifest or []
+
+    def scan_hike(self, hike_url, max_reports=None, text_only=False, save_images_dir=None,
+                  photos_mode="all", progress_callback=None, workers=1):
+        hike_url = normalize_hike_url(hike_url)
+        if progress_callback:
+            progress_callback({"event": "start", "hike_url": hike_url})
+        title = self.get_hike_title(hike_url)
+        if progress_callback and title:
+            progress_callback({"event": "start", "hike_url": hike_url, "title": title})
+        if save_images_dir:
+            os.makedirs(save_images_dir, exist_ok=True)
+
+        report_urls, listed_total = self.collect_trip_report_urls(
+            hike_url, max_reports=max_reports, workers=workers,
+            progress_callback=progress_callback,
+        )
+        total_reports = listed_total or len(report_urls)
+        result_slots = [None] * len(report_urls)
+        manifest_slots = [[] for _ in report_urls]
+        scanned = 0
+        matched_reports = 0
+        image_count = 0
+
+        if workers <= 1 or len(report_urls) <= 1:
+            for index, report_url in enumerate(report_urls):
+                self.log(f"Scanning trip report: {report_url}")
+                _, report, report_manifest = self.scan_report_safe(
+                    index, report_url, text_only=text_only,
+                    save_images_dir=save_images_dir, photos_mode=photos_mode,
+                )
+                result_slots[index] = report
+                manifest_slots[index] = report_manifest
+                scanned += 1
+                if report["text_matches"] or report["image_matches"]:
+                    matched_reports += 1
+                image_count += len(report_manifest)
+                if progress_callback:
+                    progress_callback({
+                        "event": "report",
+                        "scanned": scanned,
+                        "total": total_reports,
+                        "matches": matched_reports,
+                        "images": image_count,
+                    })
+        else:
+            max_workers = min(max(1, workers), len(report_urls))
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = [
+                    executor.submit(
+                        self.scan_report_safe, index, report_url,
+                        text_only=text_only, save_images_dir=save_images_dir,
+                        photos_mode=photos_mode,
+                    )
+                    for index, report_url in enumerate(report_urls)
+                ]
+                for future in as_completed(futures):
+                    index, report, report_manifest = future.result()
+                    result_slots[index] = report
+                    manifest_slots[index] = report_manifest
+                    scanned += 1
+                    if report["text_matches"] or report["image_matches"]:
+                        matched_reports += 1
+                    image_count += len(report_manifest)
+                    if progress_callback:
+                        progress_callback({
+                            "event": "report",
+                            "scanned": scanned,
+                            "total": total_reports,
+                            "matches": matched_reports,
+                            "images": image_count,
+                        })
+
+        reports = [
+            report for report in result_slots
+            if report and (report["text_matches"] or report["image_matches"])
+        ]
+        manifest = [
+            entry for report_manifest in manifest_slots for entry in report_manifest
+        ]
 
         if save_images_dir:
             with open(os.path.join(save_images_dir, "manifest.json"), "w") as f:
@@ -335,14 +571,14 @@ class Scanner:
                 "scanned": scanned,
                 "total": total_reports,
                 "matches": len(reports),
-                "images": len(manifest) if manifest is not None else 0,
+                "images": len(manifest) if save_images_dir else 0,
             })
 
         return {
             "hike_url": hike_url,
             "hike_title": title,
             "matching_reports": reports,
-            "images_downloaded": len(manifest) if manifest is not None else None,
+            "images_downloaded": len(manifest) if save_images_dir else None,
         }
 
 
@@ -389,7 +625,11 @@ def main():
     parser.add_argument("--max-reports", type=int, default=None,
                          help="Limit the number of trip reports scanned")
     parser.add_argument("--delay", type=float, default=0.5,
-                         help="Delay in seconds between HTTP requests (default: 0.5)")
+                         help="Delay in seconds after each HTTP request, per worker "
+                              "(default: 0.5)")
+    parser.add_argument("--workers", type=int, default=6,
+                         help="Number of trip reports/listing pages to fetch concurrently "
+                              "(default: 6; use 1 for serial scanning)")
     parser.add_argument("--text-only", action="store_true",
                          help="Skip checking photo captions (faster, text-only scan)")
     parser.add_argument("--save-images", metavar="DIR",
@@ -432,7 +672,7 @@ def main():
     results = scanner.scan_hike(
         args.hike_url, max_reports=args.max_reports, text_only=args.text_only,
         save_images_dir=args.save_images, photos_mode=args.photos_mode,
-        progress_callback=progress,
+        progress_callback=progress, workers=args.workers,
     )
     print_results(results)
 
