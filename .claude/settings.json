@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(curl -s *)",
+      "mcp__oura-ring__oura_render_hypnogram",
+      "mcp__b6b2f222-0765-4fd5-b642-1f90d62a1820__search_articles",
+      "mcp__oura-ring__oura_sleep",
+      "mcp__oura-ring__oura_daily_sleep",
+      "mcp__garmin__get_activities_by_date",
+      "mcp__c08b8d27-da10-4193-969d-8dc008a991f5__list_events",
+      "mcp__oura-ring__oura_daily_readiness",
+      "mcp__oura-ring__oura_daily_spo2",
+      "mcp__cronometer-mcp__sync_cronometer",
+      "mcp__b6b2f222-0765-4fd5-b642-1f90d62a1820__get_article_metadata",
+      "mcp__claude-in-chrome__read_network_requests"
+    ]
+  }
+}

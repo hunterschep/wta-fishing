@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+.env
+
+# Generated scan output (photos, contact sheets, reports) -- regenerate via
+# wta_fishing_scanner.py / run_region_scan.py rather than committing.
+output/
